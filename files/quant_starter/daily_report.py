@@ -326,6 +326,90 @@ def main():
 
     print(" " * 60, end="\r")  # 清除进度行
     print_report(results, executor)
+    _git_sync_log()
+
+
+def _git_sync_log():
+    """报告结束后，询问是否将 trading_log.md 同步到 git"""
+    import subprocess
+
+    repo_root = Path(__file__).parent.parent.parent  # am_god_stock_janaiidesu/
+    log_rel   = "files/quant_starter/trading_log.md"
+    today     = datetime.date.today().isoformat()
+
+    # 检查今天是否已有针对 trading_log.md 的提交
+    try:
+        out = subprocess.check_output(
+            ["git", "log", "--oneline", "--since=midnight",
+             "--", log_rel],
+            cwd=repo_root, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        already_committed_today = bool(out)
+        last_commit_msg = out.splitlines()[0] if out else ""
+    except Exception:
+        already_committed_today = False
+        last_commit_msg = ""
+
+    print(f"\n{'─'*68}")
+
+    if already_committed_today:
+        print(f"  {YLW}⚠️  今天已有一次提交记录：{R}")
+        print(f"  {DIM}{last_commit_msg}{R}\n")
+        print(f"  本次报告已写入 trading_log.md，请选择：")
+        print(f"  {BOLD}[1]{R} 覆盖今天历史（用本次内容替换今天的提交）")
+        print(f"  {BOLD}[2]{R} 追加为新提交（保留今天历史，再加一条）")
+        print(f"  {BOLD}[3]{R} 不提交，只保留本地")
+        choice = input(f"\n  请输入 1 / 2 / 3：").strip()
+    else:
+        print(f"  📤 准备将 trading_log.md 同步到 GitHub")
+        print(f"  {BOLD}[1]{R} 提交并推送")
+        print(f"  {BOLD}[2]{R} 不提交，只保留本地")
+        choice = input(f"\n  请输入 1 / 2：").strip()
+        # 统一映射：此分支下"2"=不提交，对齐已提交分支的"3"
+        if choice == "2":
+            choice = "3"
+
+    if choice == "3":
+        print(f"  {DIM}已跳过提交，trading_log.md 仅保留本地。{R}\n")
+        return
+
+    try:
+        subprocess.check_call(
+            ["git", "add", log_rel], cwd=repo_root
+        )
+
+        commit_msg = f"交易日志 {today}"
+
+        if choice == "1" and already_committed_today:
+            # 找到今天第一次提交的 hash，软重置到它之前再重新提交
+            first_sha = out.splitlines()[-1].split()[0]
+            subprocess.check_call(
+                ["git", "reset", "--soft", f"{first_sha}~1"],
+                cwd=repo_root
+            )
+            subprocess.check_call(
+                ["git", "add", log_rel], cwd=repo_root
+            )
+            subprocess.check_call(
+                ["git", "commit", "-m", f"{commit_msg}（覆盖）"],
+                cwd=repo_root
+            )
+            subprocess.check_call(
+                ["git", "push", "--force-with-lease"], cwd=repo_root
+            )
+            print(f"  {GRN}✅ 已覆盖今天的历史提交并强推。{R}\n")
+        else:
+            subprocess.check_call(
+                ["git", "commit", "-m", commit_msg], cwd=repo_root
+            )
+            subprocess.check_call(
+                ["git", "push"], cwd=repo_root
+            )
+            print(f"  {GRN}✅ 已提交并推送到 GitHub。{R}\n")
+
+    except subprocess.CalledProcessError as e:
+        print(f"  {RED}❌ Git 操作失败: {e}{R}")
+        print(f"  {DIM}可手动运行: git add {log_rel} && git commit -m '{today}' && git push{R}\n")
 
 
 if __name__ == "__main__":
