@@ -174,7 +174,32 @@ def analyze(code: str, name: str, hist: dict) -> dict:
         "adx":               adx_val,
         "signals":           signals,
     }
-    r["composite_score"] = calc_composite_score(r, hist)
+    sc = calc_composite_score(r, hist)
+    r["composite_score"] = sc
+
+    # 计算并缓存分项评分，供 DB 记录和显示
+    direction = consensus_type.value
+    sig_part = min(40, abs(score) * 0.25 + agree_count * 4
+                   + (10 if double_confirmed else 0))
+    adx_v = adx_val
+    active_s = [s for s in signals if s.type.value == direction and s.strength >= 40]
+    trend_s  = [s for s in active_s if s.strategy in ("MACD", "长均线")]
+    oscil_s  = [s for s in active_s if s.strategy in ("KDJ", "BOLL")]
+    if trend_s and adx_v > 25:
+        fit_part = min(35, 20 + (adx_v - 25) * 0.6)
+    elif oscil_s and adx_v < 20:
+        fit_part = min(35, 20 + (20 - adx_v) * 0.8)
+    elif trend_s or oscil_s:
+        fit_part = 15
+    else:
+        fit_part = 8
+    wr_part = max(0, min(25, sc - sig_part - fit_part))
+    r["_sig_score"] = round(sig_part, 1)
+    r["_fit_score"] = round(fit_part, 1)
+    r["_wr_score"]  = round(wr_part, 1)
+    r["triggered_signals"] = [s.strategy for s in active_s]
+    r["stop_loss"]  = sl
+    r["risk_pct"]   = round(abs(price - sl) / price * 100, 2) if price else 0
     return r
 
 
@@ -311,13 +336,19 @@ def _print_scored_row(r: dict, executor, direction: str):
     print(f"    止损价: {YLW}{r['stop_loss']:.2f}{R}  "
           f"({DIM}跌破离场，风险 {abs(price-r['stop_loss'])/price*100:.1f}%{R})")
 
-    # 执行模拟盘
+    # 执行模拟盘（传入决策依据）
+    from trader import db as _db
+    _db.init_db()
     if direction == "买入":
-        result = executor.buy(r["code"], r["name"], price)
+        result = executor.buy(r["code"], r["name"], price, decision=r)
         print(f"    {GRN}▶ 模拟买入{R}: {result}")
+        _db.insert_decision(r, executed=True, exec_note=result)
     elif direction == "卖出":
         result = executor.sell(r["code"], r["name"], price)
         print(f"    {RED}▶ 模拟卖出{R}: {result}")
+        _db.insert_decision(r, executed=True, exec_note=result)
+    else:
+        _db.insert_decision(r, executed=False)
 
 
 def _print_pnl_summary(results: list, executor):
@@ -373,10 +404,24 @@ def _print_pnl_summary(results: list, executor):
     else:
         print(f"\n  {DIM}当前空仓{R}")
 
-    # 写入日志
+    # 写入 Markdown 日志
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     log_daily_report(today, cash, positions, prices, realized)
     print(f"\n  {DIM}📝 已写入 trading_log.md{R}")
+
+    # 写入 SQLite 快照
+    from trader import db as _db
+    _db.init_db()
+    _db.upsert_snapshot(
+        date=today,
+        total_value=market_value,
+        cash=cash,
+        market_value=holding_value,
+        unrealized=unrealized,
+        realized=realized,
+        position_count=len(positions),
+    )
+    print(f"  {DIM}🗄  已写入 trading.db 快照{R}")
 
 
 def ensure_watchlist(path: Path):

@@ -62,10 +62,10 @@ class Executor:
     # ── 公共接口 ──────────────────────────────────────────
 
     def buy(self, code: str, name: str, price: float,
-            lots: int = DEFAULT_LOTS) -> str:
+            lots: int = DEFAULT_LOTS, decision: dict = None) -> str:
         shares = lots * 100
         if self.mode == "paper":
-            result = paper.buy(code, name, price, shares)
+            result = paper.buy(code, name, price, shares, decision=decision)
             logger.info("模拟买入 %s %s股 @%.2f", code, shares, price)
             return result
 

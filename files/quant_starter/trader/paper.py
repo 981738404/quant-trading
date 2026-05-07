@@ -7,6 +7,9 @@ import datetime
 from pathlib import Path
 from typing import Optional
 from . import logger as _logger
+from . import db as _db
+
+_db.init_db()
 
 PORTFOLIO_FILE = Path(__file__).parent.parent / "portfolio.json"
 
@@ -35,7 +38,8 @@ def status() -> dict:
     return _load()
 
 
-def buy(code: str, name: str, price: float, shares: int = 100) -> str:
+def buy(code: str, name: str, price: float, shares: int = 100,
+        decision: dict = None) -> str:
     """模拟买入，返回执行结果描述"""
     pf   = _load()
     cost = price * shares * 1.0003   # 含万3佣金
@@ -70,8 +74,12 @@ def buy(code: str, name: str, price: float, shares: int = 100) -> str:
         "shares": shares,
         "amount": cost,
     })
+    now = datetime.datetime.now().isoformat()
     _save(pf)
     _logger.log_trade("BUY", code, name, price, shares, cost, pf["cash"])
+    _db.insert_trade(time=now, action="BUY", code=code, name=name,
+                     price=price, shares=shares, amount=cost,
+                     cash_after=pf["cash"], decision=decision)
     return f"✅ 模拟买入 {name}({code}) {shares}股 @{price:.2f}  成本 {cost:.2f}  剩余资金 {pf['cash']:.2f}"
 
 
@@ -107,8 +115,12 @@ def sell(code: str, price: float, shares: Optional[int] = None) -> str:
         "amount": revenue,
         "pnl":    pnl,
     })
+    now = datetime.datetime.now().isoformat()
     _save(pf)
     _logger.log_trade("SELL", code, name, price, sell_shares, revenue, pf["cash"], pnl)
+    _db.insert_trade(time=now, action="SELL", code=code, name=name,
+                     price=price, shares=sell_shares, amount=revenue,
+                     cash_after=pf["cash"], pnl=pnl)
     sign = "盈利" if pnl >= 0 else "亏损"
     return (f"✅ 模拟卖出 {name}({code}) {sell_shares}股 @{price:.2f}  "
             f"{sign} {abs(pnl):.2f}  到账 {revenue:.2f}  总资金 {pf['cash']:.2f}")

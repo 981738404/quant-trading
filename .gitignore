@@ -23,3 +23,6 @@ files/quant_starter/dashboard.html
 
 # 敏感配置（账号密码不提交）
 files/quant_starter/trader/easytrader_config.json
+
+# SQLite 数据库（本地持久化，不提交）
+files/quant_starter/trading.db
