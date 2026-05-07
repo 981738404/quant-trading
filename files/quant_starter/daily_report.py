@@ -61,7 +61,77 @@ def fetch_rt_price(code: str):
     return None
 
 
-def analyze(code: str, name: str) -> dict:
+def _load_hist_winrates() -> dict:
+    """从 batch_result.json 读取历史胜率，返回 {code: {KDJ:%, MACD:%, ...}}"""
+    p = Path(__file__).parent / "batch_result.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return {d["code"]: d.get("backtest", {}) for d in data}
+    except Exception:
+        return {}
+
+
+def calc_composite_score(r: dict, hist: dict) -> float:
+    """
+    综合推荐评分（0-100），越高越值得操作。
+    分三个维度：
+      A. 信号强度（40分）：加权得分绝对值 + 共识同向数
+      B. 策略契合度（35分）：ADX与策略类型的匹配程度
+      C. 历史胜率（25分）：触发策略的历史命中率
+    """
+    from strategies.base import SignalType
+
+    direction = r["consensus_signal"]   # 买入/卖出/观望
+    if direction == "观望":
+        return 0.0
+
+    # ── A. 信号强度（满40）────────────────────────────────
+    raw_score  = abs(r["weighted_score"])               # 0-100+
+    agree      = r["agree_count"]                       # 0-5
+    double_bon = 10 if r["double_confirmed"] else 0
+    a = min(40, raw_score * 0.25 + agree * 4 + double_bon)
+
+    # ── B. 策略契合度（满35）─────────────────────────────
+    adx = r["adx"]
+    # 趋势型策略（MACD/长均线）触发时 → ADX高更契合
+    trend_sigs  = [s for s in r["signals"]
+                   if s.strategy in ("MACD", "长均线") and s.type.value == direction]
+    oscil_sigs  = [s for s in r["signals"]
+                   if s.strategy in ("KDJ", "BOLL") and s.type.value == direction]
+
+    if trend_sigs and adx > 25:
+        b = min(35, 20 + (adx - 25) * 0.6)
+    elif oscil_sigs and adx < 20:
+        b = min(35, 20 + (20 - adx) * 0.8)
+    elif trend_sigs or oscil_sigs:
+        b = 15   # 有信号但ADX不完全匹配
+    else:
+        b = 8    # 仅量价/短均线信号
+
+    # ── C. 历史胜率（满25）───────────────────────────────
+    code_hist = hist.get(r["code"], {})
+    triggered = [s.strategy for s in r["signals"]
+                 if s.type.value == direction and s.strength >= 40]
+    name_map  = {"KDJ":"KDJ","MACD":"MACD","短均线":"短均线",
+                 "BOLL":"BOLL","量价":"量价","长均线":"长均线"}
+    rates = []
+    for sname in triggered:
+        key = name_map.get(sname, sname)
+        bt  = code_hist.get(key, {})
+        n   = bt.get("signal_count", 0)
+        wr  = bt.get("win_rate", 50)
+        if n >= 5:
+            rates.append(wr)
+    avg_wr = sum(rates) / len(rates) if rates else 50
+    c = min(25, (avg_wr - 40) * 0.83)   # 40%胜率=0分，70%=25分
+    c = max(0, c)
+
+    return round(a + b + c, 1)
+
+
+def analyze(code: str, name: str, hist: dict) -> dict:
     from strategies.scanner import scan, stop_loss_price
     from strategies.consensus import consensus_filter, consensus_strength
     from strategies.indicators import adx as calc_adx
@@ -72,30 +142,22 @@ def analyze(code: str, name: str) -> dict:
     prev     = float(df["close"].iloc[-2])
     pct      = (price / prev - 1) * 100
 
-    # 日内振幅
     today_high = float(df["high"].iloc[-1])
     today_low  = float(df["low"].iloc[-1])
     amplitude  = (today_high - today_low) / prev * 100
 
-    # 策略扫描
     final_weighted, score, signals = scan(df)
-
-    # 共识过滤（叠加判断）
     consensus_type, agree_count, consensus_reason = consensus_filter(signals)
     confidence = consensus_strength(agree_count)
-
-    # 是否与加权结论一致（双重确认）
     double_confirmed = (final_weighted == consensus_type
                         and final_weighted.value != "观望")
 
-    # ADX
     _, _, adx_s = calc_adx(df["high"], df["low"], df["close"], 14)
     adx_val = float(adx_s.dropna().iloc[-1]) if not adx_s.dropna().empty else 20
 
-    # 止损价
     sl = float(stop_loss_price(df))
 
-    return {
+    r = {
         "code":              code,
         "name":              name,
         "price":             price,
@@ -112,6 +174,8 @@ def analyze(code: str, name: str) -> dict:
         "adx":               adx_val,
         "signals":           signals,
     }
+    r["composite_score"] = calc_composite_score(r, hist)
+    return r
 
 
 def sig_color(val: str) -> str:
@@ -120,90 +184,138 @@ def sig_color(val: str) -> str:
     return DIM
 
 
-def print_report(results: list, executor):
-    from strategies.base import SignalType
-    from trader.executor import Executor
+def _score_bar(score: float, width: int = 20) -> str:
+    """把 0-100 分映射成可视化进度条"""
+    filled = int(score / 100 * width)
+    if score >= 70:
+        color = GRN
+    elif score >= 45:
+        color = YLW
+    else:
+        color = RED
+    return f"{color}{'█' * filled}{'░' * (width - filled)}{R} {score:.0f}分"
 
+
+def _score_label(score: float) -> str:
+    if score >= 75: return f"{GRN}{BOLD}强烈推荐{R}"
+    if score >= 55: return f"{GRN}推荐{R}"
+    if score >= 40: return f"{YLW}可考虑{R}"
+    return f"{DIM}参考{R}"
+
+
+def print_report(results: list, executor):
     now  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     date = datetime.datetime.now().strftime("%Y年%m月%d日")
 
-    print(f"\n{'═'*68}")
-    print(f"  {BOLD}{MAG}每日量化盯盘报告{R}  {date}  {DIM}生成时间 {now}{R}")
-    print(f"{'═'*68}")
+    buy_list  = sorted([r for r in results if r["consensus_signal"] == "买入"],
+                       key=lambda x: -x["composite_score"])
+    sell_list = sorted([r for r in results if r["consensus_signal"] == "卖出"],
+                       key=lambda x: -x["composite_score"])
+    hold_list = [r for r in results if r["consensus_signal"] == "观望"]
 
-    # ── 分档输出 ─────────────────────────────────────────
-    double = [r for r in results if r["double_confirmed"]]
-    single = [r for r in results
-              if not r["double_confirmed"]
-              and r["consensus_signal"] != "观望"]
-    hold   = [r for r in results
-              if r["consensus_signal"] == "观望"
-              and r["weighted_signal"] == "观望"]
+    print(f"\n{'═'*72}")
+    print(f"  {BOLD}{MAG}每日量化盯盘报告{R}  {date}  {DIM}{now}{R}")
+    print(f"{'═'*72}")
 
-    # 双重确认信号
-    if double:
-        print(f"\n  {BOLD}★ 双重确认信号（加权+共识均同向）{R}")
-        print(f"  {'─'*64}")
-        for r in sorted(double,
-                        key=lambda x: -x["weighted_score"] if x["weighted_signal"] == "买入"
-                                      else x["weighted_score"]):
-            _print_stock_row(r, executor, strong=True)
+    # ══ 买入推荐 ══════════════════════════════════════════════════════
+    if buy_list:
+        print(f"\n  {GRN}{BOLD}━━  买入推荐  ({len(buy_list)}只)  ━━{R}")
+        for r in buy_list:
+            _print_scored_row(r, executor, "买入")
+    else:
+        print(f"\n  {DIM}今日无买入推荐{R}")
 
-    # 单侧信号（仅共识方向，加权不一致）
-    if single:
-        print(f"\n  {BOLD}◇ 共识信号（仅供参考，加权结论不一致）{R}")
-        print(f"  {'─'*64}")
-        for r in single:
-            _print_stock_row(r, executor, strong=False)
+    # ══ 卖出推荐 ══════════════════════════════════════════════════════
+    if sell_list:
+        print(f"\n  {RED}{BOLD}━━  卖出推荐  ({len(sell_list)}只)  ━━{R}")
+        for r in sell_list:
+            _print_scored_row(r, executor, "卖出")
+    else:
+        print(f"\n  {DIM}今日无卖出推荐{R}")
 
-    # 观望
-    if hold:
-        hold_names = "、".join(f"{r['name']}" for r in hold)
-        print(f"\n  {DIM}观望 ({len(hold)}只): {hold_names}{R}")
+    # ══ 观望 ══════════════════════════════════════════════════════════
+    print(f"\n  {DIM}━━  观望  ({len(hold_list)}只)  ━━{R}")
+    # 观望里也按加权分排序，显示得分最高的几只（可能接近信号）
+    near_signal = sorted(
+        [r for r in hold_list if abs(r["weighted_score"]) >= 30],
+        key=lambda x: -abs(x["weighted_score"])
+    )[:5]
+    if near_signal:
+        print(f"  {DIM}接近信号（得分≥30，可盯盘）:{R}")
+        for r in near_signal:
+            pct_c = RED if r["pct"] > 0 else GRN
+            ws    = r["weighted_score"]
+            ws_c  = GRN if ws > 0 else RED
+            print(f"    {r['name']}({r['code']})  "
+                  f"现价{r['price']:.2f} {pct_c}{r['pct']:+.1f}%{R}  "
+                  f"加权{ws_c}{ws:+.1f}{R}  ADX={r['adx']:.0f}")
+    rest = [r for r in hold_list if abs(r["weighted_score"]) < 30]
+    if rest:
+        names = "、".join(r["name"] for r in rest)
+        print(f"  {DIM}其余观望: {names}{R}")
 
-    # ── 持仓浮盈 + 完整盈亏摘要 ──────────────────────────
-    print(f"\n{'─'*68}")
+    # ══ 账户盈亏 ══════════════════════════════════════════════════════
+    print(f"\n{'─'*72}")
     _print_pnl_summary(results, executor)
-    print(f"{'═'*68}\n")
+    print(f"{'═'*72}\n")
 
 
-def _print_stock_row(r: dict, executor, strong: bool):
+def _print_scored_row(r: dict, executor, direction: str):
+    """打印带评分的单只股票推荐行"""
     from strategies.base import SignalType
-    sig   = r["consensus_signal"]
-    sc    = sig_color(sig)
-    price = r["price"]
-    pct_c = RED if r["pct"] > 0 else GRN
-    conf_c = (GRN if r["confidence"] in ("强", "极强")
-              else YLW if r["confidence"] == "中" else DIM)
 
-    marker = f"{BOLD}★{R}" if strong else "◇"
+    price  = r["price"]
+    pct_c  = RED if r["pct"] > 0 else GRN
+    sc     = r["composite_score"]
+    marker = "★" if r["double_confirmed"] else "◇"
+    d_tag  = f" {GRN}双重确认{R}" if r["double_confirmed"] else ""
 
-    print(f"\n  {marker} {BOLD}{r['name']}（{r['code']}）{R}  "
-          f"现价 {price:.2f}  {pct_c}{r['pct']:+.2f}%{R}  "
-          f"振幅 {r['amplitude']:.1f}%  ADX={r['adx']:.0f}")
-    print(f"    加权信号: {sig_color(r['weighted_signal'])}{r['weighted_signal']}{R}"
-          f"({r['weighted_score']:+.1f})  "
-          f"共识信号: {sc}{sig}{R}  "
-          f"可信度: {conf_c}{r['confidence']}({r['agree_count']}项同向){R}")
-    print(f"    {DIM}{r['consensus_reason']}{R}")
+    # 触发的主要指标
+    active = [s for s in r["signals"]
+              if s.type.value == direction and s.strength >= 40]
+    ind_str = "  ".join(
+        f"{GRN if direction=='买入' else RED}{s.strategy}{R}({s.strength:.0f})"
+        for s in active
+    )
 
-    # 各策略明细（只显示非观望的）
-    non_hold = [s for s in r["signals"] if s.type.value != "观望"]
-    if non_hold:
-        parts = []
-        for s in non_hold:
-            c = GRN if s.type.value == "买入" else RED
-            parts.append(f"{s.strategy}:{c}{s.type.value}{R}({s.strength:.0f})")
-        print(f"    指标: {'  '.join(parts)}")
+    print(f"\n  {marker} {BOLD}{r['name']}（{r['code']}）{R}{d_tag}")
+    print(f"    现价 {BOLD}{price:.2f}{R}  {pct_c}{r['pct']:+.2f}%{R}  "
+          f"振幅{r['amplitude']:.1f}%  ADX={r['adx']:.0f}  "
+          f"共识{r['agree_count']}项同向")
+    print(f"    推荐评分  {_score_bar(sc)}  {_score_label(sc)}")
 
-    print(f"    止损价: {YLW}{r['stop_loss']:.2f}{R}"
-          f"  (跌破此价位强制离场)")
+    # 评分明细（信号/契合/胜率各占比）
+    sig_part = min(40, abs(r["weighted_score"]) * 0.25
+                   + r["agree_count"] * 4
+                   + (10 if r["double_confirmed"] else 0))
+    # 从 calc_composite_score 重算各分项
+    adx = r["adx"]
+    active_s = [s for s in r["signals"]
+                if s.type.value == direction and s.strength >= 40]
+    trend_s = [s for s in active_s if s.strategy in ("MACD", "长均线")]
+    oscil_s = [s for s in active_s if s.strategy in ("KDJ", "BOLL")]
+    if trend_s and adx > 25:
+        fit_part = min(35, 20 + (adx - 25) * 0.6)
+    elif oscil_s and adx < 20:
+        fit_part = min(35, 20 + (20 - adx) * 0.8)
+    elif trend_s or oscil_s:
+        fit_part = 15
+    else:
+        fit_part = 8
+    wr_part = max(0, min(25, sc - sig_part - fit_part))
+    print(f"    {DIM}┌ 信号强度 {sig_part:.0f}/40  "
+          f"策略契合 {fit_part:.0f}/35  "
+          f"历史胜率 {wr_part:.0f}/25{R}")
+    if ind_str:
+        print(f"    {DIM}└ 触发指标: {R}{ind_str}")
+    print(f"    止损价: {YLW}{r['stop_loss']:.2f}{R}  "
+          f"({DIM}跌破离场，风险 {abs(price-r['stop_loss'])/price*100:.1f}%{R})")
 
-    # 自动执行模拟盘
-    if sig == "买入":
+    # 执行模拟盘
+    if direction == "买入":
         result = executor.buy(r["code"], r["name"], price)
         print(f"    {GRN}▶ 模拟买入{R}: {result}")
-    elif sig == "卖出":
+    elif direction == "卖出":
         result = executor.sell(r["code"], r["name"], price)
         print(f"    {RED}▶ 模拟卖出{R}: {result}")
 
@@ -306,6 +418,7 @@ def main():
 
     from trader.executor import Executor
     executor = Executor(mode=args.mode)
+    hist     = _load_hist_winrates()
 
     print(f"\n  {BOLD}正在扫描 {total} 只标的...{R}  "
           f"（建议每日14:30运行，收盘前30分钟操作）\n")
@@ -317,7 +430,7 @@ def main():
         name = item.get("name", code)
         print(f"  [{i+1:>2}/{total}] {name}（{code}）...", end="\r", flush=True)
         try:
-            r = analyze(code, name)
+            r = analyze(code, name, hist)
             results.append(r)
         except Exception as e:
             print(f"  [{i+1:>2}/{total}] {name}（{code}）  {RED}失败: {e}{R}")
