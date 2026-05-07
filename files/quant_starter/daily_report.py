@@ -29,7 +29,18 @@ BOLD = "\033[1m"
 DIM  = "\033[2m"
 MAG  = "\033[95m"
 
-WATCHLIST_DEFAULT = Path(__file__).parent / "watchlist.json"
+WATCHLIST_DEFAULT  = Path(__file__).parent / "watchlist.json"
+PROFILE_FILE       = Path(__file__).parent / "strategy_profile.json"
+
+
+def _load_profiles() -> dict:
+    """加载 strategy_profile.json（由 analysis/profile_builder.py 生成）"""
+    if not PROFILE_FILE.exists():
+        return {}
+    try:
+        return json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def fetch_df(code: str, days: int = 300):
@@ -62,15 +73,48 @@ def fetch_rt_price(code: str):
 
 
 def _load_hist_winrates() -> dict:
-    """从 batch_result.json 读取历史胜率，返回 {code: {KDJ:%, MACD:%, ...}}"""
-    p = Path(__file__).parent / "batch_result.json"
-    if not p.exists():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return {d["code"]: d.get("backtest", {}) for d in data}
-    except Exception:
-        return {}
+    """
+    读取历史胜率，优先合并 strategy_profile.json（更全面的个股回测）
+    和 batch_result.json（原始批量扫描结果）。
+    返回格式：{code: {KDJ: {win_rate, signal_count}, MACD: ..., ...}}
+    """
+    result = {}
+
+    # 1. 从 batch_result.json 读取原格式数据
+    batch_file = Path(__file__).parent / "batch_result.json"
+    if batch_file.exists():
+        try:
+            data = json.loads(batch_file.read_text(encoding="utf-8"))
+            for d in data:
+                result[d["code"]] = d.get("backtest", {})
+        except Exception:
+            pass
+
+    # 2. 用 strategy_profile.json 补充/覆盖（格式转换）
+    profile_file = Path(__file__).parent / "strategy_profile.json"
+    if profile_file.exists():
+        try:
+            profiles = json.loads(profile_file.read_text(encoding="utf-8"))
+            for code, p in profiles.items():
+                bt = p.get("backtest", {})
+                if not bt:
+                    continue
+                # 转换为 calc_composite_score 期望的格式
+                converted = {}
+                for ind, stats in bt.items():
+                    converted[ind] = {
+                        "win_rate":     stats.get("buy_win_rate", 50),
+                        "signal_count": stats.get("signal_count", 0),
+                    }
+                # 合并：profile 数据优先（来源更可靠）
+                if code not in result:
+                    result[code] = converted
+                else:
+                    result[code].update(converted)
+        except Exception:
+            pass
+
+    return result
 
 
 def calc_composite_score(r: dict, hist: dict) -> float:
@@ -131,10 +175,18 @@ def calc_composite_score(r: dict, hist: dict) -> float:
     return round(a + b + c, 1)
 
 
-def analyze(code: str, name: str, hist: dict) -> dict:
+def analyze(code: str, name: str, hist: dict,
+            profiles: dict = None, enable_news: bool = False) -> dict:
     from strategies.scanner import scan, stop_loss_price
     from strategies.consensus import consensus_filter, consensus_strength
     from strategies.indicators import adx as calc_adx
+
+    # 从策略画像获取该标的的自定义权重和 BOLL 参数
+    profile       = (profiles or {}).get(code, {})
+    custom_weights = profile.get("weights")
+    boll_std_mult  = profile.get("boll_std_mult", 2.0)
+    stock_type     = profile.get("stock_type", "混合型")
+    volatility     = profile.get("volatility",  "中波动")
 
     df = fetch_df(code)
     price_rt = fetch_rt_price(code)
@@ -146,7 +198,10 @@ def analyze(code: str, name: str, hist: dict) -> dict:
     today_low  = float(df["low"].iloc[-1])
     amplitude  = (today_high - today_low) / prev * 100
 
-    final_weighted, score, signals = scan(df)
+    # 用自定义权重扫描（如有画像则使用个性化权重）
+    final_weighted, score, signals = scan(df,
+                                          weights=custom_weights,
+                                          boll_std_mult=boll_std_mult)
     consensus_type, agree_count, consensus_reason = consensus_filter(signals)
     confidence = consensus_strength(agree_count)
     double_confirmed = (final_weighted == consensus_type
@@ -173,9 +228,27 @@ def analyze(code: str, name: str, hist: dict) -> dict:
         "stop_loss":         sl,
         "adx":               adx_val,
         "signals":           signals,
+        "stock_type":        stock_type,
+        "volatility":        volatility,
     }
     sc = calc_composite_score(r, hist)
     r["composite_score"] = sc
+
+    # ── 新闻情感分析（可选，--news 开关） ──────────────────────────────────
+    if enable_news:
+        try:
+            from news.sentiment import get_news_sentiment, news_modifier
+            news = get_news_sentiment(code, name, hours=48)
+            r["news"] = news
+            # 利空新闻直接压低综合评分
+            mod = news_modifier(news)
+            if mod != 0:
+                r["composite_score"] = max(0, round(r["composite_score"] + mod, 1))
+                r["news_modifier"] = mod
+        except Exception as e:
+            r["news"] = {"error": str(e), "label": "中性", "veto": False, "boost": False}
+    else:
+        r["news"] = None
 
     # 计算并缓存分项评分，供 DB 记录和显示
     direction = consensus_type.value
@@ -303,7 +376,24 @@ def _print_scored_row(r: dict, executor, direction: str):
         for s in active
     )
 
-    print(f"\n  {marker} {BOLD}{r['name']}（{r['code']}）{R}{d_tag}")
+    # 策略类型标签
+    type_tag = ""
+    st = r.get("stock_type", "")
+    vl = r.get("volatility", "")
+    if st:
+        type_tag = f" {DIM}[{st}/{vl}]{R}"
+
+    # 新闻情感标签
+    news_tag = ""
+    news = r.get("news")
+    if news and not news.get("error"):
+        label = news.get("label", "中性")
+        if label in ("重大利空", "轻度利空"):
+            news_tag = f" {RED}📰{label}{R}"
+        elif label in ("重大利好", "轻度利好"):
+            news_tag = f" {GRN}📰{label}{R}"
+
+    print(f"\n  {marker} {BOLD}{r['name']}（{r['code']}）{R}{d_tag}{type_tag}{news_tag}")
     print(f"    现价 {BOLD}{price:.2f}{R}  {pct_c}{r['pct']:+.2f}%{R}  "
           f"振幅{r['amplitude']:.1f}%  ADX={r['adx']:.0f}  "
           f"共识{r['agree_count']}项同向")
@@ -335,6 +425,16 @@ def _print_scored_row(r: dict, executor, direction: str):
         print(f"    {DIM}└ 触发指标: {R}{ind_str}")
     print(f"    止损价: {YLW}{r['stop_loss']:.2f}{R}  "
           f"({DIM}跌破离场，风险 {abs(price-r['stop_loss'])/price*100:.1f}%{R})")
+
+    # 新闻详情（仅当有利空信号时展示关键标题）
+    news = r.get("news")
+    if news and not news.get("error") and news.get("label") in ("重大利空", "轻度利空"):
+        neg_kw = news.get("neg_matches", [])
+        mod    = r.get("news_modifier", 0)
+        print(f"    {RED}⚠ 新闻风险{R}: {','.join(neg_kw[:5])}  "
+              f"{DIM}评分调整 {mod:+.0f}分{R}")
+        for h in news.get("headlines", [])[:3]:
+            print(f"    {DIM}  {h[:70]}{R}")
 
     # 执行模拟盘（传入决策依据）
     from trader import db as _db
@@ -453,6 +553,8 @@ def main():
                         help="交易模式")
     parser.add_argument("--days",  type=int, default=300,
                         help="拉取历史数据天数")
+    parser.add_argument("--news",  action="store_true",
+                        help="启用新闻情感分析（增加运行时间，需网络）")
     args = parser.parse_args()
 
     watch_path = Path(args.watch)
@@ -464,6 +566,12 @@ def main():
     from trader.executor import Executor
     executor = Executor(mode=args.mode)
     hist     = _load_hist_winrates()
+    profiles = _load_profiles()
+
+    if profiles:
+        print(f"\n  {DIM}已加载策略画像：{len(profiles)} 只标的个性化权重{R}")
+    if args.news:
+        print(f"  {YLW}新闻情感分析已开启（每只股票额外 ~1s）{R}")
 
     print(f"\n  {BOLD}正在扫描 {total} 只标的...{R}  "
           f"（建议每日14:30运行，收盘前30分钟操作）\n")
@@ -475,7 +583,7 @@ def main():
         name = item.get("name", code)
         print(f"  [{i+1:>2}/{total}] {name}（{code}）...", end="\r", flush=True)
         try:
-            r = analyze(code, name, hist)
+            r = analyze(code, name, hist, profiles=profiles, enable_news=args.news)
             results.append(r)
         except Exception as e:
             print(f"  [{i+1:>2}/{total}] {name}（{code}）  {RED}失败: {e}{R}")

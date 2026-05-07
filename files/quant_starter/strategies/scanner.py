@@ -123,8 +123,8 @@ def signal_short_ma(df: pd.DataFrame) -> Signal:
                   {"MA3": m3, "MA5": m5, "MA10": m10})
 
 
-def signal_boll(df: pd.DataFrame) -> Signal:
-    upper, mid, lower, width = boll(df["close"])
+def signal_boll(df: pd.DataFrame, std_mult: float = 2.0) -> Signal:
+    upper, mid, lower, width = boll(df["close"], std_mult=std_mult)
     c = _last(df["close"])
     u, m, l, w = _last(upper), _last(mid), _last(lower), _last(width)
 
@@ -258,15 +258,23 @@ def apply_limit_up_override(signals: List[Signal], df: pd.DataFrame) -> List[Sig
     return new_signals
 
 
-def scan(df: pd.DataFrame) -> Tuple[SignalType, float, List[Signal]]:
+def scan(df: pd.DataFrame,
+         weights: Dict = None,
+         boll_std_mult: float = 2.0) -> Tuple[SignalType, float, List[Signal]]:
     """
     对一个标的运行所有策略，返回 (最终信号类型, 综合得分, 各策略信号列表)
+
+    参数：
+        weights       : 自定义策略权重 dict，None 则使用全局 WEIGHTS
+        boll_std_mult : BOLL 带宽系数，由 strategy_profile.json 提供
     """
+    w = weights if weights else WEIGHTS
+
     runners = {
         "kdj":      signal_kdj,
         "macd":     signal_macd,
         "short_ma": signal_short_ma,
-        "boll":     signal_boll,
+        "boll":     lambda df: signal_boll(df, std_mult=boll_std_mult),
         "volume":   signal_volume,
         "long_ma":  signal_long_ma,
     }
@@ -285,15 +293,13 @@ def scan(df: pd.DataFrame) -> Tuple[SignalType, float, List[Signal]]:
     if detect_limit_up(df):
         signals = apply_limit_up_override(signals, df)
 
-    strategy_to_key = {fn(pd.DataFrame()).__class__.__name__: k
-                       for k, fn in {}.items()}
     name_to_key = {
         "KDJ": "kdj", "MACD": "macd", "短均线": "short_ma",
         "BOLL": "boll", "量价": "volume", "长均线": "long_ma",
     }
     for sig in signals:
         wkey = name_to_key.get(sig.strategy, sig.strategy.lower())
-        composite += sig.score() * WEIGHTS.get(wkey, 0)
+        composite += sig.score() * w.get(wkey, 0)
 
     if composite >= BUY_THRESHOLD:
         final = SignalType.BUY
