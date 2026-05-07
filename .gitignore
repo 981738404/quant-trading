@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Claude Code 内部文件
+.claude/
+
+# 压缩包
+*.zip
+
+# 运行时生成（不提交，各自本地维护）
+files/quant_starter/portfolio.json
+files/quant_starter/batch_result.json
+files/quant_starter/cache/
+
+# 敏感配置（账号密码不提交）
+files/quant_starter/trader/easytrader_config.json

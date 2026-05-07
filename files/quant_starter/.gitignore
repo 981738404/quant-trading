@@ -1,0 +1,34 @@
+# 环境变量（包含 API token）
+.env
+
+# 数据缓存
+cache/
+*.parquet
+*.csv
+data_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 虚拟环境
+venv/
+.venv/
+env/
